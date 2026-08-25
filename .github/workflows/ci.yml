@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+            installer_tag: v3.22.2
+          # v3.12.2 is the last nix-installer release shipping an x86_64-darwin binary.
+          - runner: macos-15-intel
+            system: x86_64-darwin
+            installer_tag: v3.12.2
+          - runner: macos-15
+            system: aarch64-darwin
+            installer_tag: v3.22.2
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+            installer_tag: v3.22.2
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+        with:
+          github-token: ""
+          source-tag: ${{ matrix.installer_tag }}
+      - name: Build and execute package
+        run: ./scripts/smoke-test.sh "${{ matrix.system }}"

@@ -34,7 +34,8 @@ repository write permission, persist no Git credentials, use no Actions cache,
 and pass no GitHub token to the Nix installer. Only after all validation succeeds
 does a separate write-enabled job re-fetch and re-verify all assets, ensure
 `main` has not moved, and commit `version.nix`; that job never executes the
-release binaries.
+release binaries. The same native package checks run for every pull request and
+can also be started manually.
 
 Permissions are scoped per job, checkout credentials are never persisted, and
 the ephemeral `GITHUB_TOKEN` reaches only the read-only release-metadata
