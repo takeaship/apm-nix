@@ -1,0 +1,204 @@
+name: Update APM
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: apm-update
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve release metadata
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      base_sha: ${{ steps.resolve.outputs.base_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      hashes: ${{ steps.resolve.outputs.hashes }}
+      changed: ${{ steps.resolve.outputs.changed }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve and verify the official release
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          readonly version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          readonly assets=(darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64)
+          temp_dir="$(mktemp -d "${RUNNER_TEMP:?}/apm-resolve.XXXXXX")"
+          trap 'rm -rf "$temp_dir"' EXIT
+
+          mapfile -t current_versions < <(sed -nE 's/^  version = "([0-9]+)\.([0-9]+)\.([0-9]+)";$/\1.\2.\3/p' version.nix)
+          [[ ${#current_versions[@]} -eq 1 ]] || { echo 'Invalid version.nix version.' >&2; exit 1; }
+          current_version="${current_versions[0]}"
+
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+            -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GH_TOKEN" \
+            -o "$temp_dir/release.json" 'https://api.github.com/repos/microsoft/apm/releases/latest'
+          tag="$(jq -er '.tag_name' "$temp_dir/release.json")"
+          version="${tag#v}"
+          [[ "$tag" == "v$version" && "$version" =~ $version_pattern ]] || { echo 'Invalid release tag.' >&2; exit 1; }
+
+          if [[ "$(printf '%s\n%s\n' "$version" "$current_version" | sort -V | head -n1)" == "$version" && "$version" != "$current_version" ]]; then
+            echo "Refusing downgrade from $current_version to $version." >&2
+            exit 1
+          fi
+
+          hashes='{}'
+          for target in "${assets[@]}"; do
+            archive="apm-$target.tar.gz"
+            sidecar="$archive.sha256"
+            archive_url="$(jq -er --arg name "$archive" '[.assets[] | select(.name == $name)] | if length == 1 then .[0].browser_download_url else error("asset count") end' "$temp_dir/release.json")"
+            sidecar_url="$(jq -er --arg name "$sidecar" '[.assets[] | select(.name == $name)] | if length == 1 then .[0].browser_download_url else error("asset count") end' "$temp_dir/release.json")"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors -o "$temp_dir/$archive" "$archive_url"
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors -o "$temp_dir/$sidecar" "$sidecar_url"
+            expected="$(awk -v name="$archive" '$1 ~ /^[0-9a-f]{64}$/ && $2 == name { n++; hash=$1 } END { if (n == 1) print hash; else exit 1 }' "$temp_dir/$sidecar")"
+            printf '%s  %s\n' "$expected" "$temp_dir/$archive" | sha256sum --check --status -
+            sri="sha256-$(printf '%s' "$expected" | xxd -r -p | base64 --wrap=0)"
+            hashes="$(jq -cn --argjson old "$hashes" --arg key "$target" --arg value "$sri" '$old + {($key): $value}')"
+          done
+
+          changed=false
+          [[ "$version" == "$current_version" ]] || changed=true
+          {
+            printf 'base_sha=%s\n' "$(git rev-parse HEAD)"
+            printf 'version=%s\n' "$version"
+            printf 'hashes=%s\n' "$hashes"
+            printf 'changed=%s\n' "$changed"
+          } >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate ${{ matrix.system }}
+    needs: resolve
+    if: needs.resolve.outputs.changed == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: macos-15-intel
+            system: x86_64-darwin
+          - runner: macos-15
+            system: aarch64-darwin
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out resolved revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.resolve.outputs.base_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25
+      - name: Build and execute candidate
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          HASHES: ${{ needs.resolve.outputs.hashes }}
+          SYSTEM: ${{ matrix.system }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > version.nix <<EOF
+          {
+            version = "$VERSION";
+            hashes = {
+              aarch64-darwin = "$(jq -er '.["darwin-arm64"]' <<<"$HASHES")";
+              x86_64-darwin = "$(jq -er '.["darwin-x86_64"]' <<<"$HASHES")";
+              aarch64-linux = "$(jq -er '.["linux-arm64"]' <<<"$HASHES")";
+              x86_64-linux = "$(jq -er '.["linux-x86_64"]' <<<"$HASHES")";
+            };
+          }
+          EOF
+          nix flake check --no-build
+          result_path="$(nix build --no-link --print-out-paths ".#packages.$SYSTEM.apm")"
+          reported="$("$result_path/bin/apm" --version)"
+          [[ "$reported" == *"$VERSION"* ]] || { echo "Unexpected version: $reported" >&2; exit 1; }
+
+  commit:
+    name: Commit validated release
+    needs: [resolve, validate]
+    if: needs.resolve.outputs.changed == 'true' && needs.validate.result == 'success'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Reverify release and prepare commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ needs.resolve.outputs.base_sha }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          HASHES: ${{ needs.resolve.outputs.hashes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_dir="$(mktemp -d "${RUNNER_TEMP:?}/apm-commit.XXXXXX")"
+          git clone --no-checkout --filter=blob:none 'https://github.com/takeaship/apm-nix.git' "$work_dir"
+          [[ "$(git -C "$work_dir" rev-parse refs/remotes/origin/main)" == "$BASE_SHA" ]] || { echo 'main changed.' >&2; exit 1; }
+          git -C "$work_dir" checkout --detach "$BASE_SHA"
+          cd "$work_dir"
+          printf 'APM_COMMIT_WORKTREE=%s\n' "$work_dir" >> "$GITHUB_ENV"
+
+          temp_dir="$(mktemp -d "${RUNNER_TEMP:?}/apm-release.XXXXXX")"
+          trap 'rm -rf "$temp_dir"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GH_TOKEN" -o "$temp_dir/release.json" 'https://api.github.com/repos/microsoft/apm/releases/latest'
+          [[ "$(jq -er '.tag_name' "$temp_dir/release.json")" == "v$VERSION" ]] || { echo 'Latest release changed.' >&2; exit 1; }
+          for target in darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64; do
+            archive="apm-$target.tar.gz"
+            archive_url="$(jq -er --arg n "$archive" '[.assets[] | select(.name == $n)] | if length == 1 then .[0].browser_download_url else error("asset count") end' "$temp_dir/release.json")"
+            sidecar_url="$(jq -er --arg n "$archive.sha256" '[.assets[] | select(.name == $n)] | if length == 1 then .[0].browser_download_url else error("asset count") end' "$temp_dir/release.json")"
+            curl -fsSL --proto '=https' --tlsv1.2 -o "$temp_dir/$archive" "$archive_url"
+            curl -fsSL --proto '=https' --tlsv1.2 -o "$temp_dir/$archive.sha256" "$sidecar_url"
+            raw="$(awk -v name="$archive" '$1 ~ /^[0-9a-f]{64}$/ && $2 == name { n++; h=$1 } END { if (n == 1) print h; else exit 1 }' "$temp_dir/$archive.sha256")"
+            printf '%s  %s\n' "$raw" "$temp_dir/$archive" | sha256sum --check --status -
+            actual="sha256-$(printf '%s' "$raw" | xxd -r -p | base64 --wrap=0)"
+            [[ "$actual" == "$(jq -er --arg key "$target" '.[$key]' <<<"$HASHES")" ]] || { echo "Hash changed: $target" >&2; exit 1; }
+          done
+
+          cat > version.nix <<EOF
+          {
+            version = "$VERSION";
+            hashes = {
+              aarch64-darwin = "$(jq -er '.["darwin-arm64"]' <<<"$HASHES")";
+              x86_64-darwin = "$(jq -er '.["darwin-x86_64"]' <<<"$HASHES")";
+              aarch64-linux = "$(jq -er '.["linux-arm64"]' <<<"$HASHES")";
+              x86_64-linux = "$(jq -er '.["linux-x86_64"]' <<<"$HASHES")";
+            };
+          }
+          EOF
+          git diff --check
+          git add version.nix
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore: update APM to $VERSION"
+
+      - name: Push prepared commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APM_COMMIT_WORKTREE"
+          git -c "credential.helper=!f() { printf '%s\\n' 'username=x-access-token' \"password=\$GH_TOKEN\"; }; f" push origin HEAD:main
