@@ -24,6 +24,7 @@ in
 stdenv.mkDerivation {
   pname = "apm";
   inherit (source) version;
+  dontStrip = true;
 
   src = fetchurl {
     url = "https://github.com/microsoft/apm/releases/download/v${source.version}/${bundleName}.tar.gz";
