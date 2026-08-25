@@ -146,10 +146,7 @@ jobs:
             };
           }
           EOF
-          nix flake check --no-build
-          result_path="$(nix build --no-link --print-out-paths ".#packages.$SYSTEM.apm")"
-          reported="$("$result_path/bin/apm" --version)"
-          [[ "$reported" == *"$VERSION"* ]] || { echo "Unexpected version: $reported" >&2; exit 1; }
+          ./scripts/smoke-test.sh "$SYSTEM" "$VERSION"
 
   commit:
     name: Commit validated release
