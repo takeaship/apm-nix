@@ -129,6 +129,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          readonly version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          readonly sri_pattern='^sha256-[A-Za-z0-9+/]{43}=$'
+          [[ "$VERSION" =~ $version_pattern ]] || { echo 'Invalid resolved version.' >&2; exit 1; }
+          for target in darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64; do
+            [[ "$(jq -er --arg key "$target" '.[$key]' <<<"$HASHES")" =~ $sri_pattern ]] || { echo "Invalid resolved hash: $target" >&2; exit 1; }
+          done
           cat > version.nix <<EOF
           {
             version = "$VERSION";
@@ -163,6 +169,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          readonly version_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          readonly sri_pattern='^sha256-[A-Za-z0-9+/]{43}=$'
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid resolved base SHA.' >&2; exit 1; }
+          [[ "$VERSION" =~ $version_pattern ]] || { echo 'Invalid resolved version.' >&2; exit 1; }
+          for target in darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64; do
+            [[ "$(jq -er --arg key "$target" '.[$key]' <<<"$HASHES")" =~ $sri_pattern ]] || { echo "Invalid resolved hash: $target" >&2; exit 1; }
+          done
           work_dir="$(mktemp -d "${RUNNER_TEMP:?}/apm-commit.XXXXXX")"
           git clone --no-checkout --filter=blob:none 'https://github.com/takeaship/apm-nix.git' "$work_dir"
           [[ "$(git -C "$work_dir" rev-parse refs/remotes/origin/main)" == "$BASE_SHA" ]] || { echo 'main changed.' >&2; exit 1; }
